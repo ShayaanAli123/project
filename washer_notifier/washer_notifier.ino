@@ -1,16 +1,30 @@
-// Washer-done notifier — Stage 3: state machine IDLE -> RUNNING -> MAYBE_DONE -> DONE.
+// Washer-done notifier — Stage 4: WiFi + phone notification on DONE.
 //
 // Board:  ESP32-S3-DevKitC-1
 // Sensor: MPU-6500 on GY-521 (WHO_AM_I=0x70), I2C SDA=21, SCL=47, VCC=3V3.
 //
-// The trick that makes this work on a real washing machine is MAYBE_DONE.
-// Real machines go quiet for 3-5 minutes between wash/rinse/spin cycles.
-// We don't declare DONE the moment vibration drops — we wait through a long
-// quiet timeout that's longer than the longest pause. If activity resumes,
-// we go back to RUNNING and reset the timer. Only sustained silence counts.
+// On the IDLE -> RUNNING -> MAYBE_DONE -> DONE state machine reaching DONE,
+// we POST a message to ntfy.sh which pushes a notification to the subscribed
+// phone. Notification code is isolated in sendNotification() so it can be
+// swapped for Telegram / Pushover / a bot / whatever later without touching
+// the detection logic.
 
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
+// ---- SECRETS / PER-DEVICE CONFIG (fill these in) ----
+// The ESP32-S3 only supports 2.4 GHz WiFi.
+static const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+static const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// Pick something unique and unguessable. Anyone who knows your topic can
+// send you notifications. In the ntfy app on your phone, subscribe to
+// this exact string.
+static const char* NTFY_TOPIC    = "your-unique-topic-name-here";
+
+// ---- HARDWARE ----
 static const uint8_t I2C_SDA_PIN = 21;
 static const uint8_t I2C_SCL_PIN = 47;
 
@@ -21,46 +35,24 @@ static const uint8_t REG_ACCEL_XOUT_H = 0x3B;
 static const float ACCEL_LSB_PER_G = 16384.0f;
 static const float G_TO_MS2        = 9.80665f;
 
-static const uint32_t SAMPLE_PERIOD_MS = 100;  // 10 Hz sampling
+static const uint32_t SAMPLE_PERIOD_MS = 100;
 
-// ---- TUNABLE PARAMETERS ----
+// ---- TUNABLE DETECTION PARAMETERS ----
+static const float    VIBRATION_THRESHOLD_MS2 = 1.5f;
+static const uint32_t STATE_DEBOUNCE_MS       = 3000;   // 3 s — rejects one-off jolts
+static const uint32_t DONE_TIMEOUT_MS         = 30000;  // 30 s (TESTING) — raise to 300000 (5 min) for real use
 
-// Vibration threshold in m/s^2. Above -> "active" sample, below -> "quiet."
-// Chosen from bench data: idle noise ~0.3, desk knocks peak ~1.5, real
-// motion is well above. Once mounted on your machine, watch a full cycle
-// in Serial Monitor and pick a value clearly above idle but below run.
-static const float VIBRATION_THRESHOLD_MS2 = 1.5f;
-
-// State hysteresis: how long a run of consecutive active-or-quiet samples
-// must persist before we change state. Prevents one-off jolts (door slam,
-// someone bumping the machine) from flipping the machine "on" or "off."
-static const uint32_t STATE_DEBOUNCE_MS = 3000;  // 3 s
-
-// How long "quiet" must last in MAYBE_DONE before we call it DONE.
-// MUST be longer than the longest pause between the machine's cycles.
-// Real deployment: 300000 (5 min), or longer if your machine has long pauses.
-// BENCH TESTING: 30 s so you can actually see the transition without waiting.
-static const uint32_t DONE_TIMEOUT_MS = 30000;   // 30 s (TESTING) — raise to 300000 for real use
+// ---- WIFI PARAMETERS ----
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;  // wait up to 20 s at boot
 
 // ---- STATE MACHINE ----
+enum State { IDLE, RUNNING, MAYBE_DONE, DONE };
 
-enum State {
-  IDLE,         // waiting for the machine to start
-  RUNNING,      // vibration seen consistently — machine is going
-  MAYBE_DONE,   // vibration stopped, but might just be a pause between cycles
-  DONE          // quiet long enough — cycle is truly over
-};
-
-State state = IDLE;
+State    state            = IDLE;
 uint32_t state_entered_ms = 0;
-
-// Timestamps of the most recent above/at-or-below threshold samples.
-uint32_t last_active_ms = 0;
-uint32_t last_quiet_ms  = 0;
-
-// Non-blocking sample pacing (no delay() in loop() anymore — the state
-// timers need millis() to keep flowing while the sketch does other work).
-uint32_t last_sample_ms = 0;
+uint32_t last_active_ms   = 0;
+uint32_t last_quiet_ms    = 0;
+uint32_t last_sample_ms   = 0;
 
 const char* stateName(State s) {
   switch (s) {
@@ -104,6 +96,68 @@ float readVibration() {
   return fabsf(magnitude - G_TO_MS2);
 }
 
+void connectWiFi() {
+  Serial.print("Connecting to WiFi ");
+  Serial.print(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         (millis() - start) < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connect timed out. Notifications will be skipped.");
+  }
+}
+
+// Notification sender. Isolated so the detection code doesn't care what
+// service we use — swap the body of this function to move to Telegram etc.
+bool sendNotification(const char* title, const char* body) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("sendNotification: WiFi not connected, attempting reconnect...");
+    WiFi.reconnect();
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 5000) {
+      delay(200);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("sendNotification: reconnect failed, giving up.");
+      return false;
+    }
+  }
+
+  // ntfy.sh serves over HTTPS. We use WiFiClientSecure with cert verification
+  // disabled — good enough for a hobby project posting to a public service.
+  // For production or sensitive data you'd pin ntfy.sh's root CA instead.
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String("https://ntfy.sh/") + NTFY_TOPIC;
+  if (!http.begin(client, url)) {
+    Serial.println("sendNotification: http.begin() failed.");
+    return false;
+  }
+  http.addHeader("Title", title);
+  http.addHeader("Content-Type", "text/plain");
+
+  int code = http.POST((uint8_t*)body, strlen(body));
+  Serial.print("sendNotification: HTTP ");
+  Serial.println(code);
+  http.end();
+
+  return code >= 200 && code < 300;
+}
+
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(10); }
@@ -118,10 +172,12 @@ void setup() {
     while (true) { delay(1000); }
   }
 
+  connectWiFi();
+
   uint32_t now = millis();
   state_entered_ms = now;
-  last_active_ms = now;
-  last_quiet_ms  = now;
+  last_active_ms   = now;
+  last_quiet_ms    = now;
 
   Serial.println("Sensor ready. State: IDLE");
 }
@@ -139,33 +195,22 @@ void loop() {
 
   switch (state) {
     case IDLE:
-      // Been consistently active for STATE_DEBOUNCE_MS -> machine started.
-      if ((now - last_quiet_ms) > STATE_DEBOUNCE_MS) {
-        transitionTo(RUNNING);
-      }
+      if ((now - last_quiet_ms) > STATE_DEBOUNCE_MS) transitionTo(RUNNING);
       break;
 
     case RUNNING:
-      // Been consistently quiet for STATE_DEBOUNCE_MS -> might be done, watch.
-      if ((now - last_active_ms) > STATE_DEBOUNCE_MS) {
-        transitionTo(MAYBE_DONE);
-      }
+      if ((now - last_active_ms) > STATE_DEBOUNCE_MS) transitionTo(MAYBE_DONE);
       break;
 
     case MAYBE_DONE:
-      // Activity resumed for the debounce window -> was just a pause, still running.
-      if ((now - last_quiet_ms) > STATE_DEBOUNCE_MS) {
-        transitionTo(RUNNING);
-      }
-      // Quiet long enough to outlast any inter-cycle pause -> truly done.
-      else if ((now - last_active_ms) > DONE_TIMEOUT_MS) {
-        transitionTo(DONE);
-      }
+      if ((now - last_quiet_ms) > STATE_DEBOUNCE_MS)          transitionTo(RUNNING);
+      else if ((now - last_active_ms) > DONE_TIMEOUT_MS)      transitionTo(DONE);
       break;
 
     case DONE:
-      // Terminal for Stage 3. Stage 4 will fire the phone notification here
-      // and reset back to IDLE so we can detect the next load.
+      // Fire the notification exactly once and reset for the next cycle.
+      sendNotification("Washer done", "Cycle complete — go swap the load.");
+      transitionTo(IDLE);
       break;
   }
 
