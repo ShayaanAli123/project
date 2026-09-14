@@ -1,13 +1,13 @@
-// Washer-done notifier — Stage 2: collapse x/y/z into one vibration number.
+// Washer-done notifier — Stage 3: state machine IDLE -> RUNNING -> MAYBE_DONE -> DONE.
 //
 // Board:  ESP32-S3-DevKitC-1
 // Sensor: MPU-6500 on GY-521 (WHO_AM_I=0x70), I2C SDA=21, SCL=47, VCC=3V3.
 //
-// The magnitude of the acceleration vector is sqrt(ax^2 + ay^2 + az^2). At
-// rest the sensor still feels gravity (~9.8 m/s^2) no matter how it's tilted,
-// so magnitude sits near 9.8 when nothing is moving. Subtracting standard
-// gravity gives a "vibration" number that hovers near 0 when still and grows
-// when the sensor is shaken — that's the signal we'll threshold on later.
+// The trick that makes this work on a real washing machine is MAYBE_DONE.
+// Real machines go quiet for 3-5 minutes between wash/rinse/spin cycles.
+// We don't declare DONE the moment vibration drops — we wait through a long
+// quiet timeout that's longer than the longest pause. If activity resumes,
+// we go back to RUNNING and reset the timer. Only sustained silence counts.
 
 #include <Wire.h>
 
@@ -21,25 +21,67 @@ static const uint8_t REG_ACCEL_XOUT_H = 0x3B;
 static const float ACCEL_LSB_PER_G = 16384.0f;
 static const float G_TO_MS2        = 9.80665f;
 
-static const uint16_t SAMPLE_PERIOD_MS = 100;
+static const uint32_t SAMPLE_PERIOD_MS = 100;  // 10 Hz sampling
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) { delay(10); }
+// ---- TUNABLE PARAMETERS ----
 
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+// Vibration threshold in m/s^2. Above -> "active" sample, below -> "quiet."
+// Chosen from bench data: idle noise ~0.3, desk knocks peak ~1.5, real
+// motion is well above. Once mounted on your machine, watch a full cycle
+// in Serial Monitor and pick a value clearly above idle but below run.
+static const float VIBRATION_THRESHOLD_MS2 = 1.5f;
 
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(REG_PWR_MGMT_1);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) {
-    Serial.println("Sensor not responding on I2C. Check wiring / power.");
-    while (true) { delay(1000); }
+// State hysteresis: how long a run of consecutive active-or-quiet samples
+// must persist before we change state. Prevents one-off jolts (door slam,
+// someone bumping the machine) from flipping the machine "on" or "off."
+static const uint32_t STATE_DEBOUNCE_MS = 3000;  // 3 s
+
+// How long "quiet" must last in MAYBE_DONE before we call it DONE.
+// MUST be longer than the longest pause between the machine's cycles.
+// Real deployment: 300000 (5 min), or longer if your machine has long pauses.
+// BENCH TESTING: 30 s so you can actually see the transition without waiting.
+static const uint32_t DONE_TIMEOUT_MS = 30000;   // 30 s (TESTING) — raise to 300000 for real use
+
+// ---- STATE MACHINE ----
+
+enum State {
+  IDLE,         // waiting for the machine to start
+  RUNNING,      // vibration seen consistently — machine is going
+  MAYBE_DONE,   // vibration stopped, but might just be a pause between cycles
+  DONE          // quiet long enough — cycle is truly over
+};
+
+State state = IDLE;
+uint32_t state_entered_ms = 0;
+
+// Timestamps of the most recent above/at-or-below threshold samples.
+uint32_t last_active_ms = 0;
+uint32_t last_quiet_ms  = 0;
+
+// Non-blocking sample pacing (no delay() in loop() anymore — the state
+// timers need millis() to keep flowing while the sketch does other work).
+uint32_t last_sample_ms = 0;
+
+const char* stateName(State s) {
+  switch (s) {
+    case IDLE:       return "IDLE";
+    case RUNNING:    return "RUNNING";
+    case MAYBE_DONE: return "MAYBE_DONE";
+    case DONE:       return "DONE";
   }
-  Serial.println("Sensor ready.");
+  return "?";
 }
 
-void loop() {
+void transitionTo(State next) {
+  Serial.print(">>> STATE: ");
+  Serial.print(stateName(state));
+  Serial.print(" -> ");
+  Serial.println(stateName(next));
+  state = next;
+  state_entered_ms = millis();
+}
+
+float readVibration() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(REG_ACCEL_XOUT_H);
   Wire.endTransmission(false);
@@ -58,16 +100,77 @@ void loop() {
   float ay = (raw_y / ACCEL_LSB_PER_G) * G_TO_MS2;
   float az = (raw_z / ACCEL_LSB_PER_G) * G_TO_MS2;
 
-  // Length of the acceleration vector (Pythagoras in 3D).
   float magnitude = sqrtf(ax * ax + ay * ay + az * az);
+  return fabsf(magnitude - G_TO_MS2);
+}
 
-  // Remove the ~9.8 m/s^2 baseline from gravity so vibration sits near 0
-  // when still, regardless of how the sensor is oriented on the machine.
-  float vibration = fabsf(magnitude - G_TO_MS2);
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
 
-  Serial.print("mag="); Serial.print(magnitude, 2);
-  Serial.print("  vib="); Serial.print(vibration, 2);
-  Serial.println(" m/s^2");
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
-  delay(SAMPLE_PERIOD_MS);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_PWR_MGMT_1);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Sensor not responding on I2C. Check wiring / power.");
+    while (true) { delay(1000); }
+  }
+
+  uint32_t now = millis();
+  state_entered_ms = now;
+  last_active_ms = now;
+  last_quiet_ms  = now;
+
+  Serial.println("Sensor ready. State: IDLE");
+}
+
+void loop() {
+  uint32_t now = millis();
+  if (now - last_sample_ms < SAMPLE_PERIOD_MS) return;
+  last_sample_ms = now;
+
+  float vib = readVibration();
+  bool is_active = vib > VIBRATION_THRESHOLD_MS2;
+
+  if (is_active) last_active_ms = now;
+  else           last_quiet_ms  = now;
+
+  switch (state) {
+    case IDLE:
+      // Been consistently active for STATE_DEBOUNCE_MS -> machine started.
+      if ((now - last_quiet_ms) > STATE_DEBOUNCE_MS) {
+        transitionTo(RUNNING);
+      }
+      break;
+
+    case RUNNING:
+      // Been consistently quiet for STATE_DEBOUNCE_MS -> might be done, watch.
+      if ((now - last_active_ms) > STATE_DEBOUNCE_MS) {
+        transitionTo(MAYBE_DONE);
+      }
+      break;
+
+    case MAYBE_DONE:
+      // Activity resumed for the debounce window -> was just a pause, still running.
+      if ((now - last_quiet_ms) > STATE_DEBOUNCE_MS) {
+        transitionTo(RUNNING);
+      }
+      // Quiet long enough to outlast any inter-cycle pause -> truly done.
+      else if ((now - last_active_ms) > DONE_TIMEOUT_MS) {
+        transitionTo(DONE);
+      }
+      break;
+
+    case DONE:
+      // Terminal for Stage 3. Stage 4 will fire the phone notification here
+      // and reset back to IDLE so we can detect the next load.
+      break;
+  }
+
+  Serial.print("vib=");
+  Serial.print(vib, 2);
+  Serial.print("  state=");
+  Serial.println(stateName(state));
 }
