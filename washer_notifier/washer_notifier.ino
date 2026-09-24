@@ -33,9 +33,24 @@ static const float G_TO_MS2        = 9.80665f;
 static const uint32_t SAMPLE_PERIOD_MS = 100;
 
 // ---- TUNABLE DETECTION PARAMETERS ----
+// VIBRATION_THRESHOLD_MS2: activity threshold in m/s^2. Below is "quiet."
+//   Start at 1.5, but on a real machine drop this to 0.6-1.0 after observing
+//   what wash / rinse phases actually read (front loaders in particular vibrate
+//   more gently during wash than a hand-shake).
+// STATE_DEBOUNCE_MS: how long a run of activity or silence must persist before
+//   we change state. Bigger = less log spam, more tolerant of one-off jolts and
+//   front-loader tumble-pauses.
+// DONE_TIMEOUT_MS: sustained silence needed to declare cycle done. Must be
+//   longer than the longest quiet gap during a cycle (drain+refill on a Samsung
+//   WW J5 is up to ~2 min, so 5 min is safe).
 static const float    VIBRATION_THRESHOLD_MS2 = 1.5f;
-static const uint32_t STATE_DEBOUNCE_MS       = 3000;   // 3 s — rejects one-off jolts
-static const uint32_t DONE_TIMEOUT_MS         = 30000;  // 30 s (TESTING) — raise to 300000 (5 min) for real use
+static const uint32_t STATE_DEBOUNCE_MS       = 5000;    // 5 s
+static const uint32_t DONE_TIMEOUT_MS         = 300000;  // 5 min
+
+// How often to print a summary line to Serial. Peaks in this window are
+// tracked and reported, so watching a full cycle is readable instead of
+// drowning in 100ms-sample spam.
+static const uint32_t SUMMARY_PERIOD_MS       = 5000;    // 5 s
 
 // ---- WIFI PARAMETERS ----
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;  // wait up to 20 s at boot
@@ -48,6 +63,10 @@ uint32_t state_entered_ms = 0;
 uint32_t last_active_ms   = 0;
 uint32_t last_quiet_ms    = 0;
 uint32_t last_sample_ms   = 0;
+
+// Summary-line tracking: peak vibration seen since the last summary print.
+float    peak_vib_window  = 0.0f;
+uint32_t last_summary_ms  = 0;
 
 const char* stateName(State s) {
   switch (s) {
@@ -209,8 +228,22 @@ void loop() {
       break;
   }
 
-  Serial.print("vib=");
-  Serial.print(vib, 2);
-  Serial.print("  state=");
-  Serial.println(stateName(state));
+  // Track the peak vibration in this summary window.
+  if (vib > peak_vib_window) peak_vib_window = vib;
+
+  // Once per SUMMARY_PERIOD_MS, print one summary line and reset the peak.
+  // Useful for calibrating threshold values against a real cycle without
+  // drowning in 10-per-second raw samples.
+  if (now - last_summary_ms >= SUMMARY_PERIOD_MS) {
+    Serial.print("t=");
+    Serial.print(now / 1000);
+    Serial.print("s  peak=");
+    Serial.print(peak_vib_window, 2);
+    Serial.print("  now=");
+    Serial.print(vib, 2);
+    Serial.print("  state=");
+    Serial.println(stateName(state));
+    peak_vib_window = 0.0f;
+    last_summary_ms = now;
+  }
 }
