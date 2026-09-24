@@ -14,15 +14,10 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
-// ---- SECRETS / PER-DEVICE CONFIG (fill these in LOCALLY — do not commit real values) ----
+// WiFi credentials + ntfy topic live in a gitignored file so they never
+// end up on GitHub. Copy secrets.example.h to secrets.h and fill it in.
 // The ESP32-S3 only supports 2.4 GHz WiFi.
-static const char* BINGU_SSID  = "YOUR_WIFI_SSID";
-static const char* BINGU_EATS  = "YOUR_WIFI_PASSWORD";
-
-// Pick something unique and unguessable. Anyone who knows your topic can
-// send you notifications. In the ntfy app on your phone, subscribe to
-// this exact string.
-static const char* NTFY_TOPIC  = "your-unique-topic-name-here";
+#include "secrets.h"
 
 // ---- HARDWARE ----
 static const uint8_t I2C_SDA_PIN = 21;
