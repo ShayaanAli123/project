@@ -14,15 +14,15 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
-// ---- SECRETS / PER-DEVICE CONFIG (fill these in) ----
+// ---- SECRETS / PER-DEVICE CONFIG (fill these in LOCALLY — do not commit real values) ----
 // The ESP32-S3 only supports 2.4 GHz WiFi.
-static const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-static const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+static const char* BINGU_SSID  = "YOUR_WIFI_SSID";
+static const char* BINGU_EATS  = "YOUR_WIFI_PASSWORD";
 
 // Pick something unique and unguessable. Anyone who knows your topic can
 // send you notifications. In the ntfy app on your phone, subscribe to
 // this exact string.
-static const char* NTFY_TOPIC    = "your-unique-topic-name-here";
+static const char* NTFY_TOPIC  = "your-unique-topic-name-here";
 
 // ---- HARDWARE ----
 static const uint8_t I2C_SDA_PIN = 21;
@@ -98,10 +98,10 @@ float readVibration() {
 
 void connectWiFi() {
   Serial.print("Connecting to WiFi ");
-  Serial.print(WIFI_SSID);
+  Serial.print(BINGU_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(BINGU_SSID, BINGU_EATS);
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED &&
